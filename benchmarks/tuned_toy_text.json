@@ -1,0 +1,129 @@
+{
+ "_about": "PPO / DQN hyperparameters of the toy-text tasks (no RL-Zoo entry exists), selected by the grid search of notebooks/tunelab.py on development seeds 0-1: highest mean final score, ties to the higher mean AUC. Read by benchmarks/zoo.py; written by tunelab.select(write=True).",
+ "DQN": {
+  "Blackjack-v1": {
+   "hp": {
+    "learning_rate": 0.001,
+    "exploration_fraction": 0.4
+   },
+   "candidate": "lr0.001_xf0.4",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": -0.006333333333333333,
+   "mean_auc": -0.01301,
+   "default_final": -0.0095,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  },
+  "CliffWalking-v1": {
+   "hp": {
+    "learning_rate": 0.001,
+    "exploration_fraction": 0.4,
+    "target_update_interval": 500
+   },
+   "candidate": "lr0.001_xf0.4_tu500",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": -13.0,
+   "mean_auc": -20.5,
+   "default_final": -13.0,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  },
+  "FrozenLake-v1": {
+   "hp": {
+    "learning_rate": 0.001,
+    "exploration_fraction": 0.4
+   },
+   "candidate": "lr0.001_xf0.4",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": 0.8166666666666667,
+   "mean_auc": 0.71,
+   "default_final": 0.8,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  },
+  "Taxi-v4": {
+   "hp": {
+    "learning_rate": 0.001
+   },
+   "candidate": "lr0.001",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": 7.7,
+   "mean_auc": -104.631,
+   "default_final": -200.0,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  }
+ },
+ "PPO": {
+  "Blackjack-v1": {
+   "hp": {
+    "learning_rate": 0.001
+   },
+   "candidate": "lr0.001",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": 0.01,
+   "mean_auc": 0.004960000000000001,
+   "default_final": 0.006,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  },
+  "CliffWalking-v1": {
+   "hp": {},
+   "candidate": "default",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": -44.166666666666664,
+   "mean_auc": -628.39,
+   "default_final": -44.166666666666664,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  },
+  "FrozenLake-v1": {
+   "hp": {
+    "learning_rate": 0.001
+   },
+   "candidate": "lr0.001",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": 0.8833333333333333,
+   "mean_auc": 0.8119999999999998,
+   "default_final": 0.8,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  },
+  "Taxi-v4": {
+   "hp": {
+    "learning_rate": 0.001
+   },
+   "candidate": "lr0.001",
+   "dev_seeds": [
+    0,
+    1
+   ],
+   "mean_final": -189.6,
+   "mean_auc": -231.949,
+   "default_final": -200.0,
+   "candidates": 8,
+   "selected": "2026-11-04 23:47"
+  }
+ }
+}

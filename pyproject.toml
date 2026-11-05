@@ -1,0 +1,119 @@
+[build-system]
+requires = ["hatchling>=1.30"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tempo-drl"                     # PyPI distribution name; the import name is `tempo_rl`
+dynamic = ["version"]                  # read from tempo_rl/version.py
+description = "TEMPO (Tempered-Entropy Multi-step Policy Optimization): one off-policy maximum-entropy actor-critic for discrete and continuous control, with a Stable-Baselines3-style API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "Daniyal Sajedi-Hosseini", email = "danialsj77@gmail.com" }]
+maintainers = [{ name = "Daniyal Sajedi-Hosseini", email = "danialsj77@gmail.com" }]
+keywords = [
+    "reinforcement-learning",
+    "deep-reinforcement-learning",
+    "off-policy",
+    "actor-critic",
+    "maximum-entropy",
+    "soft-actor-critic",
+    "gymnasium",
+    "pytorch",
+    "stable-baselines3",
+    "tempo",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "torch>=2.1",
+    "gymnasium>=1.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+mujoco = ["gymnasium[mujoco]>=1.0"]
+box2d = ["gymnasium[box2d]>=1.0"]
+atari = ["gymnasium[atari]>=1.0", "ale-py>=0.9"]
+extra = ["tensorboard>=2.9", "tqdm", "rich"]
+sb3 = ["stable-baselines3>=2.6", "sb3-contrib>=2.6"]
+all =["tempo-drl[mujoco,box2d,atari,extra,sb3]"]
+
+[project.urls]
+Homepage = "https://github.com/danialsj77/TEMPO"
+Repository = "https://github.com/danialsj77/TEMPO"
+Issues = "https://github.com/danialsj77/TEMPO/issues"
+
+[project.scripts]
+tempo-drl = "tempo_rl.cli:main"
+
+# --------------------------------------------------------------------------- build
+[tool.hatch.version]
+path = "tempo_rl/version.py"
+
+[tool.hatch.build]
+# Applies to every target (on top of the patterns in .gitignore).
+exclude = [
+    "__pycache__",
+    "*.py[cod]",
+    ".DS_Store",
+    ".ipynb_checkpoints",
+]
+
+[tool.hatch.build.targets.wheel]
+# The wheel ships the library and nothing else: no benchmarks/, notebooks/, Baselines_test/,
+# TEMPO_test/ or Comparison/.
+packages = ["tempo_rl"]
+
+[tool.hatch.build.targets.sdist]
+# Whitelist: the library only. The benchmark harness and the notebook folders never enter a
+# source distribution. pyproject.toml, README.md and LICENSE are always added by hatchling.
+include = [
+    "/tempo_rl",
+]
+exclude = [
+    "/benchmarks",
+    "/notebooks",
+    "/Baselines_test",
+    "/TEMPO_test",
+    "/Comparison",
+    "*.zip",
+    "*.npz",
+    "*.pdf",
+]
+
+# --------------------------------------------------------------------------- style
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["benchmarks/logs", "benchmarks/snapshots"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "B",     # flake8-bugbear
+    "NPY",   # numpy-specific rules
+]
+ignore = [
+    "E731",    # lambda assignments are fine for tiny schedules
+    "B905",    # zip() without strict=: too noisy for tensor code
+    "NPY002",  # np.random.seed is used on purpose to seed the global RNG (SB3 semantics)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]

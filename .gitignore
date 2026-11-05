@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.DS_Store
+.ipynb_checkpoints/
+# everything the runs and the analysis write
+logs/
+run_all.log
+Baselines_test/
+TEMPO_test/
+Comparison/figures/
+Comparison/tables/
+Comparison/timing/
+benchmarks/results/
+benchmarks/logs/
+benchmarks/snapshots/
+benchmarks/figures/
+benchmarks/tables/
+Comparison/_outdated/
+# local files that are not code
+/paper/
+/runs/
+*.zip
+*.pkl
+*.npz
+events.out.tfevents.*
+nohup.out
+.venv/
+.ruff_cache/
+.pytest_cache/
