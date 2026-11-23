@@ -1020,17 +1020,20 @@ def compute_key(variant: str) -> tuple:
 
 
 def discount_of(variant: str, env_id: str) -> float:
-    """The discount a TEMPO variant uses on a task (``gamma="auto"`` resolved from the time limit)."""
+    """The discount a TEMPO variant uses on a task: a rule (``gamma="auto"``, ``"limit"`` or ``"fifth"``) is resolved from
+    the time limit; for ``"limit"`` this is the value before the decision of the warm-up (episodes that end early)."""
     import gymnasium as gym
 
     from benchmarks import plans
     from benchmarks.variants import tempo_kwargs
-    from tempo_rl.env_util import auto_gamma
+    from tempo_rl import env_util
 
     g = tempo_kwargs(variant, env_id).get("gamma", _live_defaults()["gamma"])   # unset: the library default
-    if g == "auto":                              # the time limit the benchmark uses (ENV_KWARGS may add one)
+    if isinstance(g, str):                       # the time limit the benchmark uses (ENV_KWARGS may add one)
         kw = plans.ENV_KWARGS.get(env_id) or {}
-        return auto_gamma(kw.get("max_episode_steps", gym.spec(env_id).max_episode_steps))
+        limit = kw.get("max_episode_steps", gym.spec(env_id).max_episode_steps)
+        rule = getattr(env_util, "horizon_gamma", None) if g in ("auto", "limit") else None
+        return (rule or env_util.auto_gamma)(limit)   # "fifth" (and libraries before 2026-11-13): clip(1 - 5/T, 0.95, 0.995)
     return float(g)
 
 
@@ -1842,7 +1845,7 @@ def fingerprint(m):
                                       "train_freq", "batch_size", "tau", "buffer_size", "learning_starts",
                                       "critic_loss", "representation_lr", "exploration_bonus",
                                       "exploration_noise", "max_grad_norm", "ent_coef", "_schedule",
-                                      "_entropy_unit", "_entropy_log_offset")}
+                                      "_entropy_unit", "_entropy_log_offset", "policy_average")}
     fp.update(target_entropy=enc(get(m, "target_entropy")) if isinstance(get(m, "target_entropy"), (str, float)) else "custom",
               reward_scaling=get(m, "reward_scaler") is not None,
               learning_rate=[lr_(1.0), lr_(0.5), lr_(0.0)] if lr_ is not None else None)
@@ -1885,7 +1888,12 @@ try:
     horizon = episode_horizon(model.env)
 except Exception:
     horizon = None
-gamma_txt = f"{gam:.6g}" + (f"  (gamma={req!r}: clip(1 - 5/T, 0.95, 0.995) with the time limit T = {horizon})"
+_rules = {"auto": "clip(1 - 5/T, 0.99, 0.995)", "fifth": "clip(1 - 5/T, 0.95, 0.995)",
+          "limit": "clip(1 - 5/T, 0.99, 0.995), or clip(1 - 1/T, 0.99, 0.999) if the warm-up shows that only the time limit "
+                   "ends an episode (decided when training starts)"}
+if isinstance(req, str) and not hasattr(T, "LEGACY_ENTROPY_SCHEDULE"):    # a library from before 2026-11-13
+    _rules["auto"] = _rules["fifth"]
+gamma_txt = f"{gam:.6g}" + (f"  (gamma={req!r}: {_rules.get(req, req)} with the time limit T = {horizon})"
                             if isinstance(req, str) else "  (fixed)")
 if discrete:
     noise_txt = (f"exploration_noise={noise!r} has no effect here: discrete actions are sampled from the "
@@ -1894,7 +1902,7 @@ elif noise == "pink":
     noise_txt = "pink (1/f) Gaussian noise, correlated across the steps of an episode (data collection only)"
 else:
     noise_txt = f"{noise}: independent Gaussian samples at every step"
-frac = sched[2] if len(sched) == 3 else 0.5
+frac = sched[2] if len(sched) in (3, 5) else 0.5
 bonus_txt = (f"weight {bonus:g} -> 0, decaying linearly over the first {frac:.0%} of training: RND prediction "
              "error normalised to unit scale, added to the reward" if bonus > 0 else "off")
 lr = get(model, "lr_schedule")
@@ -1907,14 +1915,31 @@ if len(sched) == 3 and isinstance(get(model, "target_entropy"), str):
     else:
         ent_txt = (f"{s0:+g} -> {s1:+g} nats per action dimension over the first {f:.0%} of training "
                    f"({s0 * unit:+.3g} -> {s1 * unit:+.3g} nats in total)")
+elif len(sched) == 5 and isinstance(get(model, "target_entropy"), str):
+    s0, s1, f, s2, f2 = sched                     # a second, late anneal (the exploitation phase)
+    if discrete:
+        ent_txt = (f"{s0:g} -> {s1:g} x ln|A| over the first {f:.0%} of training, then -> {s2:g} x ln|A| by {f2:.0%} "
+                   f"({s0 * unit:.3g} -> {s1 * unit:.3g} -> {s2 * unit:.3g} nats)")
+    else:
+        ent_txt = (f"{s0:+g} -> {s1:+g} nats per action dimension over the first {f:.0%} of training, then -> {s2:+g} "
+                   f"by {f2:.0%} ({s0 * unit:+.3g} -> {s1 * unit:+.3g} -> {s2 * unit:+.3g} nats in total)")
 else:
     ent_txt = repr(get(model, "target_entropy"))
+_n = get(model, "n_step")
+n_txt = (f"{_n[0]}-step returns for the first {frac:.0%} of training, then {_n[1]}-step" if isinstance(_n, (tuple, list))
+         else f"n = {_n}-step returns")
+_avg = get(model, "policy_average")
+_phase = bool(get(model, "gpu_replay") and get(model, "act_on_cpu"))     # the averaged policy needs the phase engine
+avg_txt = (f"predict / evaluation use an average of the actor with a half-life of {int(_avg):,} environment steps"
+           if _avg and _phase else
+           f"policy_average={int(_avg)} is not used on this engine (predict / evaluation use the newest actor)"
+           if _avg else "off (predict / evaluation use the newest actor)")
 recipe = [["critic", critic_txt], ["actor", actor_txt], ["representation", rep_txt],
-          ["updates", f"n = {get(model, 'n_step')}-step returns; lr {lr_txt}; policy delay {get(model, 'policy_delay')}; "
+          ["updates", f"{n_txt}; lr {lr_txt}; policy delay {get(model, 'policy_delay')}; "
                       f"{int(get(model, 'gradient_steps', 1))} update(s) per step; reward scaling "
                       + ("on" if get(model, "reward_scaler") is not None else "off")],
           ["target entropy", ent_txt], ["discount gamma", gamma_txt], ["action noise", noise_txt],
-          ["novelty bonus", bonus_txt]]
+          ["novelty bonus", bonus_txt], ["averaged policy", avg_txt]]
 
 # ---- the table: resolved settings first, then every constructor argument with its source
 res = []
@@ -1935,7 +1960,8 @@ if ls is None:              # "auto": let the library resolve it for this budget
 r("learning starts", ls)
 gs, tf = int(get(model, "gradient_steps", 1)), int(get(model, "train_freq", 1))
 r("updates per environment step", f"{gs}/{tf}")
-r("multi-step return", f"n = {get(model, 'n_step')}")
+r("multi-step return", n_txt)
+r("averaged policy", avg_txt)
 r("critic", critic_txt)
 r("actor", actor_txt)
 r("representation", rep_txt)

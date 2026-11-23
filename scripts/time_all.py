@@ -1,5 +1,5 @@
 """Time every algorithm alone on every task (Comparison/timelab.py, the timing notebook's call sequence): the isolated
-training times of the rank score's robustness check. Run it after the final run, with nothing else running (it refuses
+training times of the rank's robustness check. Run it after the final run, with nothing else running (it refuses
 otherwise). Finished measurements are skipped; measurements of changed settings are timed again.
 
     python scripts/time_all.py

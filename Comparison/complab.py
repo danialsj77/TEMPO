@@ -2582,37 +2582,55 @@ def task_ranks(D: Data, env: str, metric: str = "final") -> dict:
     return {l: int(r) for l, r in zip(labs, stats.rankdata([-getattr(row[l], metric)[0] for l in labs], method="min"))}
 
 
-#: weights of the overall score of the rank table, in the order final return > training time = learning speed > oscillation
-RANK_WEIGHTS = dict(final=0.5, time=0.2, speed=0.2, oscillation=0.1)
-#: share of the best algorithm's gain over the random policy that counts as reaching the highest return: only algorithms whose mean
-#: final return reaches it earn credit for time, speed and oscillation, and the learning speed is measured to this level
+#: the criteria of the rank table in strict priority order (benchmarks/PROTOCOL.md, 2026-11-13 and 2026-11-15): sample
+#: efficiency (the fewest steps to reach the highest return and stay there), then the final return, which only separates algorithms with equal
+#: steps (:func:`priority_ranks`). The training time is not a criterion: the runs shared one machine, so their wall-clock
+#: times are not comparable
+RANK_ORDER = ("steps", "final")
+#: share of the best algorithm's gain over the random policy that counts as reaching the highest return: the steps of the first
+#: criterion are counted to this level, and only algorithms whose mean final return reaches it compete on them
 RANK_REACH = 0.95
+#: decimals at which two algorithms count as equal on a criterion (steps as a share of the budget: 1e-4 of 500,000 steps = 50
+#: steps, far below one evaluation interval; final return as a share of the best gain)
+RANK_DECIMALS = dict(steps=4, final=3)
 
 
-def overall_scores(D: Data, weights=None, reach: float = RANK_REACH, hours=None):
-    """One row per task and algorithm (the headline TEMPO and every baseline with a result): four criteria scored in [0, 1] (1 = best),
-    the overall ``score`` and ``rank`` (1 = highest score; scores equal at 3 decimals share the best rank). With ``gain`` = best mean
-    final return of the task minus the random policy's return, an algorithm reaches the highest return (``top``) when its mean final
-    return is at least ``reach`` of ``gain`` above the random policy; only such algorithms earn credit for time, speed and oscillation,
-    so the others follow, ordered by their final return:
+def priority_ranks(recs) -> list:
+    """Rank (1 = best; equal algorithms share the best rank) of the algorithms of ONE task in the strict priority order of
+    :data:`RANK_ORDER`; ``recs`` = that task's rows of :func:`overall_scores` (dicts with top, speed, final and, optionally,
+    share = the final return's share of the best gain before clipping, which then orders instead of ``final``).
 
-        score = w_final * final + top * (w_time * time + w_speed * speed + w_oscillation * oscillation)
+    1. Algorithms that reach the highest return (``top``) come before those that do not.
+    2. Among them: the fewest steps to the highest return (``speed`` = share of the budget left, mean over the seeds); if equal, the
+       higher final return.
+    3. The others follow by their final return (their steps do not count: they do not hold the level at the end of training).
 
-    * ``final``: mean final return over seeds as a share of ``gain`` above the random policy (clipped to [0, 1]);
-    * ``time``: wall-clock hours per run (mean over seeds) of the fastest ``top`` algorithm divided by the algorithm's own;
-    * ``speed``: per seed, the share of the budget left when the moving average of the return (:func:`steps_to_reach`) first reaches
-      ``reach`` of ``gain`` (0 = never), mean over the seeds;
-    * ``oscillation``: 1 / (1 + fall), fall = total fall of the evaluation return between consecutive evaluations over the run, as a
-      multiple of ``gain`` (mean over the seeds; 1 = a curve that never falls).
+    The final return is compared as its share of the best gain, unclipped where the rows give it (``share``), so two
+    algorithms below the random policy are still ordered by their return."""
+    def key(r) -> tuple:
+        return (0 if r["top"] else 1, -round(r["speed"], RANK_DECIMALS["steps"]) if r["top"] else 0.0,
+                -round(r.get("share", r["final"]), RANK_DECIMALS["final"]))
 
-    ``weights``: dict with the keys of :data:`RANK_WEIGHTS` (default). ``hours``: optional {(task, label): hours per run}, e.g. the
-    isolated timings of :func:`isolated_hours`, that replaces the runs' mean wall-clock time in ``time`` (a pair it lacks keeps its
-    wall-clock; column ``hours_source``). Tasks without a random-policy return, or whose best final return is not above it, are left out."""
+    keys = [key(r) for r in recs]
+    return [1 + sum(k2 < k for k2 in keys) for k in keys]
+
+
+def overall_scores(D: Data, reach: float = RANK_REACH):
+    """One row per task and algorithm (the headline TEMPO and every baseline with a result): the two criteria of the rank table
+    and the ``rank`` (1 = best; :func:`priority_ranks`). With ``gain`` = best mean final return of the task minus the random
+    policy's return, an algorithm reaches the highest return (``top``) when its mean final return is at least ``reach`` of ``gain``
+    above the random policy. Strict priority order: among the ``top`` algorithms the fewest ``steps`` to the highest return, then
+    the higher final return; the others follow by their final return.
+
+    * ``steps``: per seed, the environment steps until the moving average of the return reaches ``reach`` of ``gain`` and stays
+      there until the end of training (:func:`steps_to_hold`: a curve that reaches the level and falls back is counted from its
+      last return to the level); a seed that is below the level at the end counts as the full budget; mean over the seeds.
+      ``speed`` = the same as the share of the budget left (1 - steps / budget), ``reached`` = number of seeds that hold the level;
+    * ``final``: mean final return over seeds as a share of ``gain`` above the random policy (clipped to [0, 1]).
+
+    Tasks without a random-policy return, or whose best final return is not above it, are left out."""
     import pandas as pd
-    from scipy import stats
 
-    w = dict(RANK_WEIGHTS if weights is None else weights)
-    hmap = dict(hours or {})
     rows = []
     for env in D.tasks:
         cells, rnd = D.cells.get(env, {}), D.randoms.get(env)
@@ -2626,48 +2644,51 @@ def overall_scores(D: Data, weights=None, reach: float = RANK_REACH, hours=None)
         recs = []
         for l in labs:
             runs = D.rows(env)[l]
-            steps = [steps_to_reach(r, level, D.cfg.ma_window) for r in runs]
-            walls = [r.wall_h for r in runs if r.wall_h and np.isfinite(r.wall_h)]
-            fall = [float(np.sum(np.maximum(0.0, -np.diff(r.curve)))) / gain if r.curve.size > 1 else 0.0 for r in runs]
+            steps = [steps_to_hold(r, level, D.cfg.ma_window) for r in runs]
             final = float(np.clip((cells[l].final[0] - rnd) / gain, 0.0, 1.0))
             recs.append(dict(task=env, algorithm=l, n=len(runs), final_return=float(cells[l].final[0]),
-                             hours=float(hmap[(env, l)]) if (env, l) in hmap else (float(np.mean(walls)) if walls else math.nan),
-                             hours_source="isolated" if (env, l) in hmap else "wall-clock", reached=int(np.isfinite(steps).sum()),
-                             fall=float(np.mean(fall)), top=bool(final >= reach - 1e-9), final=final,
+                             steps=float(np.mean([min(st, r.budget) if np.isfinite(st) else r.budget for st, r in zip(steps, runs)])),
+                             reached=int(np.isfinite(steps).sum()),
+                             top=bool(final >= reach - 1e-9), final=final, share=float((cells[l].final[0] - rnd) / gain),
                              speed=float(np.mean([1.0 - st / r.budget if np.isfinite(st) else 0.0 for st, r in zip(steps, runs)]))))
-        fastest = min((r["hours"] for r in recs if r["top"] and np.isfinite(r["hours"]) and r["hours"] > 0), default=math.nan)
-        for r in recs:
-            r["time"] = float(fastest / r["hours"]) if np.isfinite(fastest) and np.isfinite(r["hours"]) and r["hours"] > 0 else 0.0
-            r["oscillation"] = 1.0 / (1.0 + r["fall"])
-            r["score"] = float(w["final"] * r["final"]
-                               + (w["time"] * r["time"] + w["speed"] * r["speed"] + w["oscillation"] * r["oscillation"] if r["top"] else 0.0))
-        for r, rk in zip(recs, stats.rankdata([-round(r["score"], 3) for r in recs], method="min")):
+        for r, rk in zip(recs, priority_ranks(recs)):
             r["rank"] = int(rk)
         rows += recs
-    cols = ["task", "algorithm", "n", "final_return", "hours", "hours_source", "reached", "fall", "top", "final", "time", "speed",
-            "oscillation", "score", "rank"]
+    cols = ["task", "algorithm", "n", "final_return", "steps", "reached", "top", "final", "speed", "rank"]
     return pd.DataFrame(rows, columns=cols)
 
 
-def rank_podium(D: Data, weights=None, hours=None) -> tuple:
-    """(markdown, LaTeX) table of the overall rank of every algorithm on every task with a TEMPO result (:func:`overall_scores`;
-    family order, as the curve grid), the toy-text tasks (PPO and DQN references) included; ``hours``: see :func:`overall_scores`;
+def _rank_steps(x: float) -> str:
+    """Environment steps for a table cell: 42k, 1.5k, 800."""
+    return f"{x / 1000:.0f}k" if x >= 9950 else f"{x / 1000:.1f}k" if x >= 1000 else f"{x:.0f}"
+
+
+def _rank_share(f: float) -> str:
+    """Final return as a share of the best gain for a table cell of an algorithm below the level of :data:`RANK_REACH`: whole per
+    cent, but one decimal, rounded down, where the whole number would show the level itself (94.8%, never 95%)."""
+    return f"{100 * f:.0f}%" if round(100 * f) < 100 * RANK_REACH else f"{math.floor(1000 * f + 1e-9) / 10:.1f}%"
+
+
+def rank_podium(D: Data) -> tuple:
+    """(markdown, LaTeX) table of the overall rank of every algorithm on every task with a TEMPO result (:func:`overall_scores`:
+    strict priority order of steps to the highest return, then final return; family order, as the curve grid), the
+    toy-text tasks (PPO and DQN references) included; a markdown cell gives the rank and in
+    brackets the mean steps to the highest return of an algorithm that reaches it, else its final return as a share of the best gain;
     a cell with fewer than the expected seeds is marked (n=k) in the markdown and listed in a comment of the LaTeX; a star marks the highest mean
     final return of the task (:func:`task_ranks`, ties included). LaTeX: ranks 1-3 circled (rank 1 bold), lower ranks plain, a dash
     where the algorithm does not apply to the action space; the last rows count, over the tasks each algorithm ran on, its first
     places and its stars. The LaTeX is a bare ``tabular`` for ``\\input`` inside a table environment (booktabs, tikz)."""
     labels = [D.main] + list(D.cfg.baselines)
-    sc = overall_scores(D, weights, hours=hours)
+    sc = overall_scores(D)
     sc = sc[sc["task"].isin([e for e in D.tasks if D.main in D.cells.get(e, {})])] if len(sc) else sc
     if not len(sc):
         return "No task has a finished TEMPO run yet.\n", None
-    w = dict(RANK_WEIGHTS if weights is None else weights)
     first, best, ran = Counter(), Counter(), Counter()
     circled = {1: r"\rankone", 2: r"\ranktwo", 3: r"\rankthree"}
     md_rows, body, prev, partial = [], [], None, []
     for env, g in sc.groupby("task", sort=False):
         rk = dict(zip(g["algorithm"], g["rank"]))
-        score = dict(zip(g["algorithm"], g["score"]))
+        note = {r.algorithm: _rank_steps(r.steps) if r.top else _rank_share(r.final) for r in g.itertuples()}
         nseeds = dict(zip(g["algorithm"], g["n"]))
         partial += [f"{re.sub(r'-v[0-9]+$', '', env)} {l} (n={nseeds[l]})" for l in rk if nseeds[l] < D.cfg.n_expected]
         star = {l for l, r in task_ranks(D, env).items() if r == 1}
@@ -2678,7 +2699,7 @@ def rank_podium(D: Data, weights=None, hours=None) -> tuple:
         name, untuned = re.sub(r"-v\d+$", "", env), D.is_untuned(env)
         miss = {l: D.status(env, l) for l in labels if l not in rk}
         md_rows.append([name + (" †" if untuned else "")]
-                       + [((f"**{rk[l]}**" if rk[l] == 1 else str(rk[l])) + f" ({score[l]:.2f})" + ("*" if l in star else "")
+                       + [((f"**{rk[l]}**" if rk[l] == 1 else str(rk[l])) + f" ({note[l]})" + ("*" if l in star else "")
                            + (f" (n={nseeds[l]})" if nseeds[l] < D.cfg.n_expected else "")) if l in rk
                           else "pending" if miss[l] == "pending" else "-" for l in labels])
         group = RANK_GROUPS.get(R.family(env).split("-")[0], R.family(env))
@@ -2692,18 +2713,23 @@ def rank_podium(D: Data, weights=None, hours=None) -> tuple:
         body.append(" & ".join([R._tex_escape(name) + (r"$^\dagger$" if untuned else "")] + cells) + r" \\")
     wins = [f"{first[l]}/{ran[l]}" if ran[l] else "-" for l in labels]
     stars = [f"{best[l]}/{ran[l]}" if ran[l] else "-" for l in labels]
-    wtxt = ", ".join(f"{k} {v:g}" for k, v in w.items())
     md = (R.md_table(["Task"] + labels, md_rows + [["First places / tasks run"] + wins, ["Highest final return (*) / tasks run"] + stars],
                      align="l" + "c" * len(labels))
-          + f"\nOverall rank (1 = best) by the score in brackets ({wtxt}): only algorithms whose mean final return is within "
-          f"{100 * (1 - RANK_REACH):g}% of the best algorithm's gain over the random policy earn credit for time, speed and oscillation "
-          "(`overall_scores`; every criterion in `tables/rank_overall_scores.csv`); * = highest mean final return of the task (ties "
+          + "\nOverall rank (1 = best) in a strict priority order: (1) the fewest environment steps to reach the highest return and stay there, (2) the "
+          "higher final return, which only separates algorithms with equal steps (the training time is not a criterion). "
+          f"An algorithm reaches the highest return when its mean final return is within {100 * (1 - RANK_REACH):g}% "
+          "of the best algorithm's gain over the random policy. In brackets: for such an algorithm the steps until the "
+          f"{D.cfg.ma_window}-evaluation moving average of its return reaches that level and no longer falls below it (mean over the "
+          "seeds; a seed that is below it at the end counts as the full budget); for the others, which follow ordered by their final return, the final "
+          "return as a share of the best gain (`overall_scores`, `priority_ranks`; every criterion in "
+          "`tables/rank_overall_scores.csv`). * = highest mean final return of the task (ties "
           f"included). - = {_na_text(D, list(dict.fromkeys(sc['task'])))}; pending = expected, no finished run."
           + (" † = some or all baselines ran with library defaults (untuned)."
              if any(D.is_untuned(t) for t in dict.fromkeys(sc["task"])) else "")
           + (f" (n=k): fewer than the {D.cfg.n_expected} expected seeds: {', '.join(partial)}." if partial else "")
           + _partly_note(D, list(dict.fromkeys(sc["task"]))) + "\n")
     tex = "\n".join(["% Generated by Comparison/complab.py (rank_podium); \\input inside a table environment; requires \\usepackage{booktabs,tikz}.",
+                     "% Rank: strict priority order (fewest steps to the highest return, then final return).",
                      *([f"% PARTIAL cells (fewer than {D.cfg.n_expected} seeds): {', '.join(partial)}"] if partial else []),
                      RANK_TEX_MACROS, r"\begin{tabular}{@{}l" + "c" * len(labels) + r"@{}}", r"\toprule",
                      " & ".join(["Task"] + [R._tex_escape(l) for l in labels]) + r" \\", r"\midrule", *body, r"\midrule",
@@ -3074,22 +3100,12 @@ def show_scores(D: Data) -> None:
         register(D, f"{metric}_scores", title, md=md, tex=tex)
         show_md(f"#### {title}\n\n" + md)
     pmd, ptex = rank_podium(D)
-    register(D, "rank_podium", "Overall rank of every algorithm on every task (weighted final return, training time, learning speed, oscillation)",
-             md=pmd, tex=ptex)
-    register(D, "rank_overall_scores", "The four criteria of the overall rank, scored 0-1 per task, and the weighted score", df=overall_scores(D).round(4))
-    iso, missing = isolated_hours(D)
-    if iso:                      # robustness check of PROTOCOL.md 2026-11-04 rule 8: isolated timings instead of contended wall-clock
-        imd, itex = rank_podium(D, hours=iso)
-        inote = ("Robustness check (benchmarks/PROTOCOL.md, 2026-11-04 rule 8): the same rank score with each run's isolated training time "
-                 "(Comparison/timing, total_h: one run measured alone) instead of its contended wall-clock"
-                 + (f"; without a current timing of their runs' settings, so with their wall-clock: {', '.join(f'{t} {l}' for t, l in missing)}"
-                    if missing else "") + ".")
-        register(D, "rank_podium_isolated_time", "Overall rank with isolated training times (robustness check)", md=imd + "\n" + inote + "\n",
-                 tex=itex)
-        register(D, "rank_overall_scores_isolated_time", "The overall rank's criteria with isolated training times",
-                 df=overall_scores(D, hours=iso).round(4))
-        show_md("#### Robustness check: overall rank with isolated training times\n\n" + imd + "\n" + inote)
-    show_md("#### Overall rank of every algorithm on every task (weighted score in brackets; * = highest final return)\n\n" + pmd)
+    register(D, "rank_podium", "Overall rank of every algorithm on every task (strict priority order: steps to the highest return, "
+             "then final return)", md=pmd, tex=ptex)
+    register(D, "rank_overall_scores", "The criteria of the overall rank per task: steps to the highest return, final return",
+             df=overall_scores(D).round(4))
+    show_md("#### Overall rank of every algorithm on every task (fewest steps to the highest return, then final return; "
+            "* = highest final return)\n\n" + pmd)
     register(D, "scores_long", "Final return and AUC, one row per task and algorithm", df=score_long(D))
     df = vs_best_frame(D)
     md = vs_best_md(D, df)
@@ -3407,30 +3423,42 @@ def _agg_name(A: dict, l: str) -> str:
     return f"{'Best baseline*' if l == BEST else l} ({k} of {n})" if k < n else f"{'Best baseline*' if l == BEST else l} ({k})"
 
 
-def plot_aggregate(D: Data, A: dict, stem: str = "aggregate_overall"):
+def plot_aggregate(D: Data, A: dict, stem: str = "aggregate_overall", single: bool = False):
     """Overall aggregate figure: IQM, median, mean and optimality gap of the normalised score with 95% stratified-bootstrap
     CIs per algorithm, the performance profile and the probability of improvement P(TEMPO > X). Algorithms that ran on fewer than
-    half of the tasks are left out of the panels (listed in the caption), those on only some of them are drawn pale."""
+    half of the tasks are left out of the panels (listed in the caption), those on only some of them are drawn pale.
+    ``single`` = the one-column layout for a two-column paper (the four statistics in a 2 x 2 block, the profile and the
+    probability of improvement below them)."""
     labels, faded, omitted = _figure_algos(A)
     names = [_agg_name(A, l) for l in labels]
     no_colour = {l for l in labels if not _colour_ok(D, l)}    # told apart by colour alone in the profile: left out there
     h_top = 0.2 * len(labels) + 0.75
     with figure_style() as plt:
-        fig = plt.figure(figsize=(fs.DOUBLE, h_top + 2.35 + 0.45), layout="constrained")
-        gs = fig.add_gridspec(2, 4, height_ratios=[h_top, 2.35])
+        if single:
+            h_row = 0.15 * len(labels) + 0.5                  # compact rows: the figure fills most of one column
+            fig = plt.figure(figsize=(fs.SINGLE, 3 * h_row + 1.45 + 0.75), layout="constrained")
+            gs = fig.add_gridspec(4, 2, height_ratios=[h_row, h_row, 1.45, h_row])
+            cells_top = [gs[0, 0], gs[0, 1], gs[1, 0], gs[1, 1]]
+            cell_profile, cell_poi = gs[2, :], gs[3, :]
+        else:
+            fig = plt.figure(figsize=(fs.DOUBLE, h_top + 2.35 + 0.45), layout="constrained")
+            gs = fig.add_gridspec(2, 4, height_ratios=[h_top, 2.35])
+            cells_top = [gs[0, k] for k in range(4)]
+            cell_profile, cell_poi = gs[1, :3], gs[1, 3]
         stats = (("IQM", "IQM", fs.NORMALISED_LABEL), ("median", "Median", fs.NORMALISED_LABEL), ("mean", "Mean", fs.NORMALISED_LABEL),
                  ("OG", "Optimality gap", "Gap (lower is better)"))
         top = []
         for k, (stat, ttl, xl) in enumerate(stats):
-            ax = fig.add_subplot(gs[0, k], sharey=top[0] if top else None)
+            ax = fig.add_subplot(cells_top[k], sharey=top[0] if top else None)
             top.append(ax)
-            _interval_panel(ax, D, [(l,) + tuple(A["agg"][l][stat]) for l in labels], 0.0 if stat == "OG" else 1.0, xl, ylabels=(k == 0),
+            _interval_panel(ax, D, [(l,) + tuple(A["agg"][l][stat]) for l in labels], 0.0 if stat == "OG" else 1.0, xl,
+                            ylabels=(k % 2 == 0 if single else k == 0),
                             names=names, faded=faded)
             ax.set_title(ttl)
         _norm_ticks(top, "x", nbins=4)                     # one tick rule / decimals on the four normalised panels
-        axp = fig.add_subplot(gs[1, :3])
+        axp = fig.add_subplot(cell_profile)
         _profile_panel(axp, D, A, "Performance profile", skip=(set(A["agg"]) - set(labels)) | no_colour, faded=faded)
-        axq = fig.add_subplot(gs[1, 3])
+        axq = fig.add_subplot(cell_poi)
         poi = {b: v for b, v in A["poi"].items() if len(v["tasks"]) / len(A["tasks"]) >= 0.5}
         null = A.get("poi_null", {}).get(BEST)
         if poi:
@@ -3438,7 +3466,8 @@ def plot_aggregate(D: Data, A: dict, stem: str = "aggregate_overall"):
             pf = {b for b, v in poi.items() if len(v["tasks"]) < len(A["tasks"])}
             _interval_panel(axq, D, items, 0.5, f"P({D.main} > X)", faded=pf, marks=A.get("poi_null"), ref_kind="chance",
                             names=[f"{'Best baseline*' if b == BEST else b} ({len(poi[b]['tasks'])})" for b in poi])
-            axq.yaxis.tick_right()
+            if not single:
+                axq.yaxis.tick_right()
             axq.set_xlim(0, 1)
             axq.set_xticks([0, 0.5, 1])
             axq.set_title("Probability of improvement")
@@ -3695,6 +3724,7 @@ def show_aggregates(D: Data) -> dict:
     register(D, "aggregate_statistics", "Aggregate normalised scores (IQM, median, mean, optimality gap) and probability of improvement", df=fr, md=md)
     first = next(iter(results.values()))
     plot_aggregate(D, first)
+    plot_aggregate(D, first, stem="aggregate_overall_single", single=True)   # the same figure for one column of a paper
     plot_aggregate_by_family(D, results, stem="aggregate_like_for_like", names=set(ACTION_SCOPES) | {TUNED_SCOPE},
                              label="like-for-like task sets (one action space or one kind of baseline tuning)")
     plot_aggregate_by_family(D, results)
@@ -3764,6 +3794,17 @@ def steps_to_reach(run, target: float, window: int = 3) -> float:
     st, y = smoothed(run, window)
     hit = np.flatnonzero(y >= target)
     return float(st[hit[0]]) if hit.size else math.inf
+
+
+def steps_to_hold(run, target: float, window: int = 3) -> float:
+    """First evaluation step from which the moving average of the evaluation return stays at or above ``target`` until the end
+    of the run (inf = it is below ``target`` at the end): reaching the level and falling back does not count."""
+    st, y = smoothed(run, window)
+    ok = y >= target
+    if not ok.size or not ok[-1]:
+        return math.inf
+    below = np.flatnonzero(~ok)
+    return float(st[below[-1] + 1]) if below.size else float(st[0])
 
 
 def _median_steps(st) -> float:

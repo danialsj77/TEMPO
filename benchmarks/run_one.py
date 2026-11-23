@@ -103,8 +103,9 @@ def run_tempo(job: dict, record) -> dict:
             if self.num_timesteps % job["eval_freq"] < model.n_envs:
                 record(self.num_timesteps, *evaluate(predict, job["env"], job["n_eval"],
                                                      lambda: make_env(job["env"], job.get("env_kwargs"))),
-                       extra={"ent_coef": float(model.log_ent_coef.exp()),
-                              "target_entropy": model.current_target_entropy()})
+                       extra={"ent_coef": float(model.log_ent_coef.detach().exp()),
+                              "target_entropy": model.current_target_entropy(),
+                              "n_step": int(model.current_n_step()), "gamma": float(model.gamma)})
             return True
 
     model.learn(job["steps"], callback=Eval())
@@ -122,6 +123,12 @@ def run_tempo(job: dict, record) -> dict:
     net_arch = {k: [int(w) for w in v] for k, v in model.policy.net_arch.items()}
     out = {"config": cfg, "torch_threads": torch.get_num_threads(), "gamma": float(model.gamma),
            "net_arch": net_arch}
+    out["gamma_request"] = model.gamma_request if isinstance(model.gamma_request, str) else float(model.gamma_request)
+    out["n_step"] = list(model.n_step) if isinstance(model.n_step, tuple) else int(model.n_step)
+    out["entropy_schedule"] = list(model._schedule)
+    out["policy_average"] = model.policy_average if (model.gpu_replay and model.act_on_cpu) else None   # as used
+    if model._horizon_bound is not None:
+        out["horizon_bound"] = bool(model._horizon_bound)
     if model.reward_scaler is not None and model.reward_scaler.kappa != 1.0:
         out["scale_kappa"] = float(model.reward_scaler.kappa)
     if model.horizon_audition:

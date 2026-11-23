@@ -129,7 +129,8 @@ def episode_horizon(env) -> int | None:
 
 
 def auto_gamma(horizon: int | None, default: float = 0.99) -> float:
-    """Discount from the episode time limit ``T``: ``clip(1 - 5/T, 0.95, 0.995)``.
+    """Discount from the episode time limit ``T``: ``clip(1 - 5/T, 0.95, 0.995)`` (``gamma="fifth"``,
+    TEMPO's rule until 2026-11-13; :func:`horizon_gamma` is the rule of ``gamma="auto"`` since).
 
     The effective horizon ``1/(1-gamma)`` becomes a fifth of the episode, the
     heuristic of TD-MPC2 (Hansen et al., 2024). Without a time limit: ``default``.
@@ -137,6 +138,25 @@ def auto_gamma(horizon: int | None, default: float = 0.99) -> float:
     if not horizon:
         return default
     return float(min(0.995, max(0.95, 1.0 - 5.0 / float(horizon))))
+
+
+def horizon_gamma(horizon: int | None, bound: bool = False, default: float = 0.99) -> float:
+    """Discount of ``gamma="auto"`` from the episode time limit ``T`` (TEMPO's horizon rule).
+
+    * ``bound=False`` (episodes end early: by failure, or by success under random actions):
+      ``clip(1 - 5/T, 0.99, 0.995)``, an effective horizon ``1/(1-gamma)`` of a fifth of the time limit
+      (the heuristic of TD-MPC2) and never below the standard 0.99;
+    * ``bound=True`` (only the time limit ends an episode): ``clip(1 - 1/T, 0.99, 0.999)``, the whole
+      time limit, because nothing shorter bounds what an action can affect.
+
+    Without a time limit: ``default``. :class:`~tempo_rl.TEMPO` decides ``bound`` once from the episodes
+    of its random warm-up (:meth:`~tempo_rl.TEMPO._decide_horizon`).
+    """
+    if not horizon:
+        return default
+    if bound:
+        return float(min(0.999, max(0.99, 1.0 - 1.0 / float(horizon))))
+    return float(min(0.995, max(0.99, 1.0 - 5.0 / float(horizon))))
 
 
 def horizon_kappa(gamma: float, horizon: int | None) -> float:

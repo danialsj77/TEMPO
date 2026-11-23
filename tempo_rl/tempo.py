@@ -28,7 +28,7 @@ Algorithm (one gradient step, default configuration)::
 
 Data collection draws the continuous policy's Gaussian sample from pink (1/f) noise,
 one sequence per episode, and ``gamma="auto"`` sets the discount from the time limit
-``T`` as ``clip(1 - 5/T, 0.95, 0.995)``. Continuous actions live in unit coordinates
+``T`` as ``clip(1 - 5/T, 0.99, 0.995)``. Continuous actions live in unit coordinates
 ``[-1, 1]^d`` inside the agent, so the entropy target means the same thing whatever
 the environment's action bounds; ``Box`` vector observations are normalised with
 running statistics. The default values are in the "Default recipe" table of the
@@ -52,7 +52,13 @@ with the non-finite critic loss reported at the next action or phase boundary (o
 ``learn``), after that update has been applied, and NaN actor outputs do not raise
 ``torch.distributions``' ``ValueError`` (see :mod:`tempo_rl._sync`).
 
-A five-value ``entropy_schedule`` adds a second, late entropy anneal (research option; see :class:`TEMPO`).
+TEMPO 2 (default since 2026-11-13; ``"tempo2"`` in ``benchmarks/variants.py``) is the fast recipe with three
+changes: the automatic discount never falls below 0.99 (it was ``clip(1 - 5/T, 0.95, 0.995)``, now
+``gamma="fifth"``); the continuous entropy target is lowered a second time, from -0.5 to -2.0 nats per dimension
+between 50 % and 80 % of the budget (an exploitation phase; a five-value ``entropy_schedule``); and ``predict``
+answers with an exponential average of the actor (``policy_average``, half-life 5,000 environment steps), which
+removes most transient drops of the evaluated policy. ``"fast"`` keeps the former default bit for bit. Evidence:
+single-seed diagnostic runs on development seeds (benchmarks/PROTOCOL.md, entry of 2026-11-13).
 """
 from __future__ import annotations
 
@@ -78,7 +84,7 @@ from gymnasium import spaces
 from . import _sync
 from .buffers import DeviceReplay, NStepReplayBuffer
 from .callbacks import BaseCallback, make_callback
-from .env_util import auto_gamma, episode_horizon, make_vec_env, wrap_env
+from .env_util import auto_gamma, episode_horizon, horizon_gamma, make_vec_env, wrap_env
 from .logger import Logger, configure_logger, mean_of, scalar_of
 from .policies import POLICY_ALIASES, TempoPolicy
 from .preprocessing import check_action_space
@@ -93,7 +99,11 @@ Schedule = Callable[[float], float]
 #: Tempered target-entropy schedule (start, end, anneal fraction).
 #: Continuous: nats per action dimension in unit coordinates.
 #: Discrete: fraction of the maximum entropy ln|A|.
-DEFAULT_ENTROPY_SCHEDULE = {"continuous": (0.0, -0.5, 0.5), "discrete": (0.7, 0.05, 0.5)}
+#: Continuous (since 2026-11-13): five values, a second anneal from the end of tempering to 80 % of the budget
+#: (the exploitation phase).
+DEFAULT_ENTROPY_SCHEDULE = {"continuous": (0.0, -0.5, 0.5, -2.0, 0.8), "discrete": (0.7, 0.05, 0.5)}
+#: The default until 2026-11-13 (what a model file saved before that date was trained with).
+LEGACY_ENTROPY_SCHEDULE = {"continuous": (0.0, -0.5, 0.5), "discrete": (0.7, 0.05, 0.5)}
 
 
 def get_device(device: str | torch.device = "auto", has_images: bool = False,
@@ -176,27 +186,35 @@ class TEMPO:
         ``invariance="samples"`` one update of 1024 stands for 4 updates of 256).
     :param tau: Polyak coefficient of the target critics (used only with
         ``policy_kwargs=dict(batch_norm=False)``; the default critics have none).
-    :param gamma: ``"auto"`` (default): ``clip(1 - 5/T, 0.95, 0.995)`` from the
-        environment's time limit ``T`` (the TD-MPC2 heuristic; 0.99 without a limit), or a
-        fixed discount factor.
+    :param gamma: ``"auto"`` (default): ``clip(1 - 5/T, 0.99, 0.995)`` from the environment's time limit
+        ``T``: an effective horizon of a fifth of the time limit (the TD-MPC2 heuristic), never below the
+        standard 0.99 (0.99 without a limit). ``"fifth"``: the rule until 2026-11-13,
+        ``clip(1 - 5/T, 0.95, 0.995)``. ``"limit"`` (research option): as ``"auto"``, but when the episodes
+        seen once the random warm-up is over show that only the time limit ends an episode (at most 10 % of
+        them terminated), the whole time limit becomes the horizon, ``clip(1 - 1/T, 0.99, 0.999)``, and the
+        running return of the reward scale is kept through time limits (:meth:`_decide_horizon`; it helps
+        Swimmer and hurts HalfCheetah, see benchmarks/PROTOCOL.md). Or a fixed discount factor.
     :param train_freq: environment steps (per env) between training phases. ``None`` (default):
         ``max(1, round(batch_size / (ref_batch * n_envs)))``, so that about ``ref_batch`` = 256 samples
         are processed per environment step: 1 with the default 4 environments, 4 with one environment
         (a ``gymnasium.Env`` instance or a one-environment vector env).
     :param gradient_steps: gradient steps per training phase (-1: as many as env steps).
-    :param n_step: horizon of the multi-step return (1 recovers SAC's target).
+    :param n_step: horizon of the multi-step return (1 recovers SAC's target; default 3), or a pair
+        ``(early, late)`` (research option): ``early`` steps during the tempering phase (the anneal fraction
+        of the entropy schedule, the first half of training by default), ``late`` afterwards. In the
+        diagnostic runs of 2026-11-13 the pair ``(3, 1)`` raised HalfCheetah and lost Walker2d
+        (benchmarks/PROTOCOL.md), so it is not the default.
     :param policy_delay: actor and temperature update every ``policy_delay`` critic steps.
     :param ent_coef: ``"auto"`` (learned, initial 1.0), ``"auto_<init>"``, or a fixed float.
     :param target_entropy: ``"auto"`` (tempered schedule), a fixed float (nats), or
         ``f(progress_remaining) -> nats``.
-    :param entropy_schedule: ``(start, end, anneal_fraction)`` for the tempered schedule;
-        per-dimension nats in unit coordinates (continuous) or fractions of ln|A|
-        (discrete). ``None`` uses TEMPO's defaults. A five-value schedule
-        ``(start, mid, frac, end, frac2)`` (research option) adds a second, late anneal:
-        ``start -> mid`` over the first ``frac`` of the budget (as the three-value form), then
-        ``mid -> end`` linearly between ``frac`` and ``frac2``, constant afterwards; the novelty bonus
-        still decays over ``frac``. Example: ``(0.0, -0.5, 0.5, -1.0, 0.8)`` keeps lowering the
-        continuous entropy floor after 50 % instead of freezing it at -0.5 nats per dimension.
+    :param entropy_schedule: the tempered schedule of the entropy target; per-dimension nats in unit
+        coordinates (continuous) or fractions of ln|A| (discrete). ``None`` uses TEMPO's defaults
+        (:data:`DEFAULT_ENTROPY_SCHEDULE`). Three values ``(start, end, anneal_fraction)``: ``start -> end``
+        over the first ``anneal_fraction`` of the budget, constant afterwards. Five values
+        ``(start, mid, frac, end, frac2)`` add a second, late anneal (an exploitation phase):
+        ``start -> mid`` over the first ``frac`` of the budget, then ``mid -> end`` linearly between
+        ``frac`` and ``frac2``, constant afterwards; the novelty bonus still decays over ``frac``.
     :param critic_loss: ``"mse"`` (regression critic) or ``"hl_gauss"`` (categorical
         critic over 101 bins on [-5, 5] trained with the HL-Gauss cross-entropy).
     :param reward_scaling: divide rewards by a running discounted-return scale
@@ -290,6 +308,11 @@ class TEMPO:
         exponential re-count ``beta1^kappa`` would give 0.0625); SALE and novelty
         ``(0.9, 0.999) -> (0.6, 0.996)``. ``"sqrt"`` needs ``invariance="samples"``.
     :param ref_batch: the batch size the default hyperparameters were tuned for (256).
+    :param policy_average: half-life, in environment steps, of an exponential average of the acting
+        parameters (the actor, the fixed SALE state encoder and their Batch-Renorm statistics) that
+        ``predict`` uses in place of the newest ones; ``None`` or 0: off. Training and data collection always
+        use the newest actor. Available with the phase engine (``gpu_replay`` and ``act_on_cpu``, the
+        default for vector observations); ignored otherwise.
     :param brn_impl: ``"closed_form"`` (default) or ``"autograd"``: the training-mode kernel of every
         Batch-Renorm layer of the actor and the critics. ``"closed_form"`` computes the function
         ``y = x a + c`` (``a = w / sqrt(s2 + eps)``, ``c = b - m a`` with the warm-up / renormalised
@@ -329,7 +352,7 @@ class TEMPO:
                  learning_rate: float | Schedule = 1e-3, buffer_size: int = 1_000_000,
                  learning_starts: int | None = None, batch_size: int = 1024, tau: float = 0.005,
                  gamma: float | str = "auto", train_freq: int | None = None, gradient_steps: int = 1,
-                 n_step: int = 3, policy_delay: int = 3, ent_coef: str | float = "auto",
+                 n_step: int | tuple[int, int] = 3, policy_delay: int = 3, ent_coef: str | float = "auto",
                  target_entropy: str | float | Schedule = "auto",
                  entropy_schedule: tuple[float, float, float] | None = None,
                  critic_loss: str = "hl_gauss", reward_scaling: bool | None = None,
@@ -342,7 +365,7 @@ class TEMPO:
                  gpu_replay: bool | None = None, act_on_cpu: bool | None = None,
                  pipeline: bool | None = None, fused_adam: bool = True, amp: str | None = "auto",
                  invariance: str = "samples", lr_rule: str | None = None, ref_batch: int = 256,
-                 brn_impl: str = "closed_form",
+                 brn_impl: str = "closed_form", policy_average: int | None = 5000,
                  _init_setup_model: bool = True):
         if isinstance(policy, str) and policy not in self.policy_aliases:
             raise ValueError(f"unknown policy {policy!r}; use one of {POLICY_ALIASES}")
@@ -356,7 +379,15 @@ class TEMPO:
         #: the requested train_freq (None: resolved from batch_size and n_envs, :meth:`_resolve_train_freq`)
         self._train_freq_request = None if train_freq is None else int(train_freq)
         self.train_freq, self.gradient_steps = self._train_freq_request or 1, int(gradient_steps)
-        self.n_step, self.policy_delay = int(n_step), int(policy_delay)
+        if isinstance(n_step, (tuple, list)):
+            if len(n_step) != 2 or min(int(v) for v in n_step) < 1:
+                raise ValueError(f"n_step must be a positive integer or a pair (early, late), got {n_step!r}")
+            self.n_step = (int(n_step[0]), int(n_step[1]))
+        else:
+            if int(n_step) < 1:
+                raise ValueError(f"n_step must be a positive integer or a pair (early, late), got {n_step!r}")
+            self.n_step = int(n_step)
+        self.policy_delay = int(policy_delay)
         self.ent_coef, self.target_entropy = ent_coef, target_entropy
         self.entropy_schedule = entropy_schedule
         if critic_loss not in ("mse", "hl_gauss"):
@@ -419,6 +450,11 @@ class TEMPO:
         if brn_impl not in ("autograd", "closed_form"):
             raise ValueError(f"brn_impl must be 'autograd' or 'closed_form', got {brn_impl!r}")
         self.brn_impl = brn_impl
+        if policy_average is not None and float(policy_average) < 0:
+            raise ValueError(f"policy_average must be None or a non-negative number of environment steps, got {policy_average!r}")
+        #: half-life (environment steps) of the averaged acting parameters that ``predict`` uses; None / 0: off
+        self.policy_average = int(policy_average) if policy_average else None
+        self._avg_flat = None            # the average (device tensor, the layout of _sync_src), phase engine only
         if (self.policy_kwargs.get("fused_critics") and brn_impl != "closed_form"):
             raise ValueError("policy_kwargs fused_critics=True runs the closed-form Batch-Renorm kernel: "
                              "pass brn_impl='closed_form' with it")
@@ -465,10 +501,23 @@ class TEMPO:
         self._scale_resets_on_truncation = True
 
         self.gamma_request = gamma
+        #: gamma="limit": the horizon is decided once, from the episodes of the random warm-up
+        #: (:meth:`_decide_horizon`); until then gamma is the rule's value for tasks whose episodes end early
+        self._horizon_pending = False
+        self._horizon_bound: bool | None = None       # True: only the time limit ends an episode (once decided)
+        self._warmup_ends = [0, 0]                    # terminations, truncations seen while the decision is pending
+        #: (rewards, terminated) per vector step while it is pending; None: no complete record
+        self._warmup_log: list | None = []
         if isinstance(gamma, str):
-            if gamma != "auto":
-                raise ValueError(f"gamma must be a float or 'auto', got {gamma!r}")
-            self.gamma = auto_gamma(episode_horizon(self.env)) if self.env is not None else 0.99
+            if gamma not in ("auto", "limit", "fifth"):
+                raise ValueError(f"gamma must be a float, 'auto', 'limit' or 'fifth', got {gamma!r}")
+            horizon = episode_horizon(self.env) if self.env is not None else None
+            if gamma == "fifth":                      # the rule until 2026-11-13: clip(1 - 5/T, 0.95, 0.995)
+                self.gamma = auto_gamma(horizon) if self.env is not None else 0.99
+            else:                                     # clip(1 - 5/T, 0.99, 0.995)
+                self.gamma = horizon_gamma(horizon) if self.env is not None else 0.99
+                # "limit": decide after the warm-up whether only the time limit ends this task's episodes
+                self._horizon_pending = gamma == "limit" and bool(horizon) and not self.horizon_audition
         else:
             self.gamma = float(gamma)
 
@@ -708,6 +757,72 @@ class TEMPO:
                     fused_adam=self.fused_adam, amp=self.amp, amp_resolved=self._amp,
                     brn_impl=self.brn_impl, fused_critics=bool(getattr(self.policy, "fused_critics", False)))
 
+    # ============================================================ horizon
+    #: gamma="limit": a task counts as bounded by its time limit when at most this share of the episodes
+    #: seen so far ended by termination (success by luck under random actions stays below it)
+    HORIZON_TERMINATION_SHARE = 0.1
+    #: vector steps of rewards kept for rebuilding the return scale at the decision (memory guard)
+    _WARMUP_LOG_MAX = 200_000
+
+    def _warmup_observe(self, rewards, terms, truncs) -> None:
+        """Count the episode ends of one vector step and keep its rewards (``gamma="limit"``, until the
+        horizon is decided)."""
+        terms = np.asarray(terms, dtype=bool)
+        self._warmup_ends[0] += int(terms.sum())
+        self._warmup_ends[1] += int((np.asarray(truncs, dtype=bool) & ~terms).sum())
+        if self._warmup_log is not None:
+            if len(self._warmup_log) < self._WARMUP_LOG_MAX:
+                self._warmup_log.append((np.array(rewards, dtype=np.float64), terms.copy()))
+            else:
+                self._warmup_log = None               # too long to keep: the scale is not rebuilt
+
+    def _decide_horizon(self) -> None:
+        """``gamma="limit"``: decide once whether only the time limit ends this task's episodes.
+
+        Called before an update once the random warm-up is over; it waits until at least as many episodes
+        have ended as there are environments. If at most :attr:`HORIZON_TERMINATION_SHARE` of them ended by
+        termination, the task is bounded by its time limit ``T``: the discount becomes
+        ``clip(1 - 1/T, 0.99, 0.999)`` (:func:`~tempo_rl.env_util.horizon_gamma`) and the running return of
+        the reward scale is kept through time limits from now on, as the critic bootstraps through them
+        (the scale is rebuilt from the rewards seen so far). Otherwise nothing changes: the discount stays
+        ``clip(1 - 5/T, 0.99, 0.995)``. No update has used the discount before a decision taken at the end
+        of the warm-up; a later decision (very long episodes) changes it for the following updates.
+        """
+        n_term, n_trunc = self._warmup_ends
+        if n_term + n_trunc < max(1, int(self.n_envs)):
+            return                                    # not enough episodes yet: ask again at the next update
+        self._horizon_pending = False
+        horizon = episode_horizon(self.env)
+        bound = bool(horizon) and n_term <= self.HORIZON_TERMINATION_SHARE * (n_term + n_trunc)
+        self._horizon_bound = bound
+        log, self._warmup_log = self._warmup_log, None
+        if not bound:
+            return
+        gamma = horizon_gamma(horizon, bound=True)
+        self.gamma = gamma
+        if self.replay_buffer is not None:
+            self.replay_buffer.gamma = gamma
+        self._scale_resets_on_truncation = False
+        if self.reward_scaler is not None:
+            if log is None:                           # incomplete record (a loaded model, a very long wait):
+                self.reward_scaler.gamma = gamma      # keep the statistics, use the new discount from now on
+            else:
+                fresh = RewardScaler(self.n_envs, gamma, self.reward_scaler.v_max, self.reward_scaler.eps)
+                fresh.kappa = self.reward_scaler.kappa
+                for rewards, terms in log:
+                    fresh.update(rewards, terms)
+                self.reward_scaler = fresh
+
+    def current_n_step(self) -> int:
+        """Horizon of the multi-step return at the current training progress: ``n_step`` itself, or for a pair
+        ``(early, late)`` the first value until the end of the tempering phase (the anneal fraction of the
+        entropy schedule) and the second afterwards."""
+        if isinstance(self.n_step, int):
+            return self.n_step
+        early, late = self.n_step
+        frac = self._schedule[2] if hasattr(self, "_schedule") else 0.5
+        return early if (1.0 - self._current_progress_remaining) < frac else late
+
     # ============================================================ entropy
     def current_target_entropy(self) -> float:
         """Target entropy (nats) at the current training progress."""
@@ -788,14 +903,14 @@ class TEMPO:
             self.replay_buffer = DeviceReplay(
                 min(rows_needed, max_rows), self.policy.spec,
                 () if self.discrete else self.action_space.shape, self.discrete,
-                n_envs=self.n_envs, n_step=self.n_step, gamma=self.gamma, device=self.device,
+                n_envs=self.n_envs, n_step=self.current_n_step(), gamma=self.gamma, device=self.device,
                 seed=None if self.seed is None else self.seed + 12345)
         elif self.replay_buffer is None:
             self.replay_buffer = NStepReplayBuffer(
                 min(rows_needed, max_rows), self.policy.spec,
                 action_shape=() if self.discrete else self.action_space.shape,
                 action_dtype=np.int64 if self.discrete else np.float32, n_envs=self.n_envs,
-                n_step=self.n_step, gamma=self.gamma, device=self.device,
+                n_step=self.current_n_step(), gamma=self.gamma, device=self.device,
                 seed=None if self.seed is None else self.seed + 12345)
         else:
             self.replay_buffer.ensure_capacity(self.replay_buffer.n_added + rows_needed, max_rows)
@@ -859,6 +974,8 @@ class TEMPO:
             if self.num_timesteps > self._learning_starts_resolved and self.replay_buffer.size > 0:
                 steps = self.gradient_steps if self.gradient_steps >= 0 else self.train_freq * self.n_envs
                 if steps > 0:
+                    if self._horizon_pending:
+                        self._decide_horizon()
                     self.train(steps, self.batch_size)
                     if self._audition is not None:
                         self._audition_step(steps)
@@ -917,6 +1034,8 @@ class TEMPO:
             if self._colored is not None:
                 for i in np.flatnonzero(dones):
                     self._colored.reset(int(i))
+            if self._horizon_pending:
+                self._warmup_observe(rewards, terms, truncs)
             if self.reward_scaler is not None:
                 self.reward_scaler.update(rewards, dones if self._scale_resets_on_truncation else terms)
             self._update_normalizer(new_obs)
@@ -951,6 +1070,8 @@ class TEMPO:
     def _prepare_phase_engine(self) -> None:
         """(Re)build the host copies used by the phase engine from the device networks."""
         _sync.full_sync(self.device, check=False)
+        if self._host_loads != self._policy_loads():
+            self._avg_flat = None                     # the policy state was loaded since: its average is stale
         self._host = copy.deepcopy(self.policy).to("cpu")
         self._host.train(False)
         self._host.critic.qs = torch.nn.ModuleList()     # acting never reads the critic MLPs
@@ -980,6 +1101,17 @@ class TEMPO:
         host = torch.empty(flat.shape, dtype=flat.dtype)
         host.copy_(flat, non_blocking=True)
         return host
+
+    @torch.no_grad()
+    def _average_policy(self, env_steps: int) -> None:
+        """``policy_average``: move the exponential average of the acting parameters (actor, fixed SALE
+        encoder and their Batch-Renorm statistics) towards the present ones; ``env_steps`` environment steps
+        have passed since the last call. Stays on the device (no wait)."""
+        flat = torch.cat([t.reshape(-1) for t in self._sync_src])
+        if self._avg_flat is None or self._avg_flat.shape != flat.shape:
+            self._avg_flat = flat.clone()
+        else:
+            self._avg_flat.lerp_(flat, 1.0 - 0.5 ** (float(env_steps) / float(self.policy_average)))
 
     @torch.no_grad()
     def _load_snapshot(self, flat: torch.Tensor, dst=None) -> None:
@@ -1034,6 +1166,8 @@ class TEMPO:
             if self._colored is not None:
                 for i in np.flatnonzero(dones):
                     self._colored.reset(int(i))
+            if self._horizon_pending:
+                self._warmup_observe(rewards, terms, truncs)
             if self.reward_scaler is not None:
                 self.reward_scaler.update(rewards, dones if self._scale_resets_on_truncation else terms)
             self._update_normalizer(new_obs)
@@ -1114,7 +1248,11 @@ class TEMPO:
                 if self.num_timesteps > self._learning_starts_resolved and self.replay_buffer.size > 0:
                     steps = self.gradient_steps if self.gradient_steps >= 0 else self.train_freq * self.n_envs
                     if steps > 0:
+                        if self._horizon_pending:
+                            self._decide_horizon()
                         self.train(steps, self.batch_size)
+                        if self.policy_average:
+                            self._average_policy(self.train_freq * self.n_envs)
                         if self.act_on_cpu:
                             snap = self._snapshot_policy()
                         nf = self.__dict__.get("_nonfinite")
@@ -1161,6 +1299,7 @@ class TEMPO:
             self._host.normalizer.load_state_dict(self.policy.normalizer.state_dict())
         self._host_fetched_at = None
         self._host_loads = self._policy_loads()
+        self._avg_flat = None                         # the average restarts from the loaded parameters
 
     @torch.no_grad()
     def _host_predictor(self):
@@ -1180,7 +1319,9 @@ class TEMPO:
             self._host_fetched_at = None
         stamp = (self.num_timesteps, self._n_updates)
         if self._host_fetched_at != stamp:
-            flat = torch.cat([t.reshape(-1) for t in self._sync_src]).cpu()
+            src = (self._avg_flat if self.policy_average and self._avg_flat is not None
+                   else torch.cat([t.reshape(-1) for t in self._sync_src]))     # the averaged or the newest actor
+            flat = src.cpu()
             _sync.synced(self.device, check=False)    # .cpu() waited for the whole queue
             self._load_snapshot(flat, self._host_eval_dst)
             if self._host_eval.normalizer is not None:
@@ -1214,6 +1355,12 @@ class TEMPO:
                 g["lr"] = (self.representation_lr * self._lr_mult if self._lr_mult != 1.0
                            else self.representation_lr)
         h_target = self.current_target_entropy()
+        if not isinstance(self.n_step, int):          # (early, late): the replay builds its windows at sample time
+            n_now = self.current_n_step()
+            if self.replay_buffer.n_step != n_now:
+                self.replay_buffer.n_step = n_now
+                if isinstance(self.replay_buffer, DeviceReplay):
+                    self.replay_buffer._gpow = None
         scale = self.reward_scaler.scale if self.reward_scaler is not None else 1.0
         # The temperature acts on *unscaled* rewards: in scaled units the entropy
         # bonus is alpha / scale, so alpha's dynamics do not depend on the scaling.
@@ -1587,6 +1734,9 @@ class TEMPO:
         refreshed from the device whenever the model has trained or its policy state has been loaded
         (``set_parameters``, ``policy.load_state_dict``) since the last call. Parameters changed in
         place by other means (e.g. ``p.data.copy_(...)``) are not detected: call ``set_parameters``."""
+        if (self._host is None and self.policy_average and self._avg_flat is not None
+                and self.gpu_replay and self.act_on_cpu):
+            self._prepare_phase_engine()          # a loaded model: its averaged actor answers, as before the save
         if self.act_on_cpu and self._host is not None:
             return self._host_predictor().predict(observation, state, episode_start, deterministic)
         return self.policy.predict(observation, state, episode_start, deterministic)
@@ -1661,7 +1811,9 @@ class TEMPO:
                     # speed options (2026-10-22 / 2026-10-23); files saved before them load with
                     # _LEGACY_DEFAULTS
                     "gpu_replay", "act_on_cpu", "pipeline", "fused_adam", "amp", "invariance",
-                    "lr_rule", "ref_batch", "brn_impl")
+                    "lr_rule", "ref_batch", "brn_impl",
+                    # 2026-11-13; files saved before it load with policy_average=None (predict used the newest actor)
+                    "policy_average")
 
     #: The values of the speed options before they became the default (2026-10-23): the C1 engine. A
     #: file that does not record one of them was saved by an older library, whose default was this value.
@@ -1747,6 +1899,10 @@ class TEMPO:
             progress_remaining=self._current_progress_remaining,
             learning_starts_resolved=self._learning_starts_resolved,
             entropy_log_offset=self._entropy_log_offset,
+            entropy_schedule_resolved=list(self._schedule),
+            gamma_request=self.gamma_request, horizon_bound=self._horizon_bound,
+            horizon_pending=self._horizon_pending, warmup_ends=list(self._warmup_ends),
+            scale_resets_on_truncation=self._scale_resets_on_truncation,
             # an audition interrupted by save() cannot resume (the shadow is not saved): "auto"
             horizon_choice=self._horizon_choice or ("auto" if self.horizon_audition else None),
             audition_log=self._audition_log,
@@ -1767,6 +1923,8 @@ class TEMPO:
         if self.rep_optimizer is not None:
             tempo_state["rep_optimizer"] = self.rep_optimizer.state_dict()
             tempo_state["rep_updates"] = torch.tensor(self._rep_updates)
+        if self._avg_flat is not None:
+            tempo_state["policy_average"] = self._avg_flat.detach().cpu()
         save_to_zip(path, data, self.policy.state_dict(), tempo_state, __version__)
 
     @classmethod
@@ -1813,6 +1971,19 @@ class TEMPO:
             hyper.setdefault(k, v)
         if isinstance(hyper.get("entropy_schedule"), list):
             hyper["entropy_schedule"] = tuple(hyper["entropy_schedule"])
+        if hyper.get("entropy_schedule") is None and "entropy_schedule" not in kwargs:
+            # the default schedule changed on 2026-11-13: a file keeps the schedule it was trained with (files
+            # saved before that date do not record it: their default was the three-value schedule)
+            resolved = data.get("entropy_schedule_resolved")
+            if resolved is not None:
+                hyper["entropy_schedule"] = tuple(resolved)
+            else:
+                discrete = data["action_space"].get("type") == "Discrete" if isinstance(data.get("action_space"), dict) else None
+                if discrete is not None:
+                    hyper["entropy_schedule"] = LEGACY_ENTROPY_SCHEDULE["discrete" if discrete else "continuous"]
+        hyper.setdefault("policy_average", None)      # files before 2026-11-13: predict used the newest actor
+        if isinstance(hyper.get("n_step"), list):
+            hyper["n_step"] = tuple(hyper["n_step"])
         hyper["target_entropy"] = schedule_from_json(hyper.get("target_entropy"))
         hyper.update(kwargs)
         lr = hyper.pop("learning_rate", data.get("learning_rate"))
@@ -1845,6 +2016,9 @@ class TEMPO:
         if model.rep_optimizer is not None and "rep_optimizer" in tempo_state:
             model.rep_optimizer.load_state_dict(tempo_state["rep_optimizer"])
             model._rep_updates = int(tempo_state.get("rep_updates", torch.tensor(0)))
+        if model.policy_average and model.gpu_replay and model.act_on_cpu and "policy_average" in tempo_state:
+            model._avg_flat = tempo_state["policy_average"].to(model.device)   # only the phase engine keeps it up to date
+            model._host_loads = model._policy_loads()     # a later load of the policy state drops this average
         model.num_timesteps = int(data.get("num_timesteps", 0))
         model._n_updates = int(data.get("n_updates", 0))
         model._episode_num = int(data.get("episode_num", 0))
@@ -1858,11 +2032,24 @@ class TEMPO:
             model.reward_scaler.load_state(data["reward_scaler"])
         if env is not None:
             model.set_env(env, force_reset=force_reset)
-            if model.gamma_request == "auto" and model._horizon_choice != "long":
-                # resolve against the env given to load (a chosen long horizon is kept)
-                model.gamma = auto_gamma(episode_horizon(model.env))
+            if isinstance(model.gamma_request, str) and model._horizon_choice != "long":
+                # a rule given to load(): resolve it against this env, as the constructor does (a chosen long
+                # horizon is kept)
+                horizon = episode_horizon(model.env)
+                model.gamma = auto_gamma(horizon) if model.gamma_request == "fifth" else horizon_gamma(horizon)
+                model._horizon_pending = (model.gamma_request == "limit" and bool(horizon)
+                                          and not model.horizon_audition)
                 if model.reward_scaler is not None:
                     model.reward_scaler.gamma = model.gamma
+        # the horizon rule (files since 2026-11-13): the saved discount and scale mode are kept; a decision
+        # that was still pending is taken again from the episodes that follow (its reward log is not saved)
+        if "gamma_request" in data and "gamma" not in kwargs and "gamma" not in (custom_objects or {}):
+            model.gamma_request = data["gamma_request"]
+            model._horizon_bound = data.get("horizon_bound")
+            model._scale_resets_on_truncation = bool(data.get("scale_resets_on_truncation", True))
+            model._horizon_pending = bool(data.get("horizon_pending", False))
+            model._warmup_ends = [int(v) for v in (data.get("warmup_ends") or [0, 0])]
+            model._warmup_log = None                  # the rewards seen before the file was saved are not in it
         return model
 
     def get_parameters(self) -> dict[str, dict]:
@@ -1916,6 +2103,7 @@ class TEMPO:
         if isinstance(buf, DeviceReplay) != bool(self.gpu_replay):
             raise TypeError(f"a {type(buf).__name__} cannot be used with gpu_replay={self.gpu_replay}")
         buf.__dict__.pop("recent", None)          # sampling option of buffers pickled before 2026-10-23
+        buf.n_step = self.current_n_step()        # windows are built at sample time: this model's horizon
         self.replay_buffer = buf
         if isinstance(buf, DeviceReplay):
             buf.to(self.device)

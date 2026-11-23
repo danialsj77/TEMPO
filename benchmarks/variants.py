@@ -70,6 +70,9 @@ def tempo_kwargs(variant: str, env_id: str) -> dict:
     from .plans import DISCRETE
     sched = kw.pop("entropy_schedule_continuous", None)
     dsched = kw.pop("entropy_schedule_discrete", None)
+    n_cont = kw.pop("n_step_continuous", None)
+    if n_cont is not None and env_id not in DISCRETE:   # continuous actions only (discrete ones keep "n_step")
+        kw["n_step"] = tuple(n_cont) if isinstance(n_cont, (tuple, list)) else int(n_cont)
     if sched is not None and env_id not in DISCRETE:   # continuous schedules only
         kw["entropy_schedule"] = tuple(sched)
     if dsched is not None and env_id in DISCRETE:
@@ -106,11 +109,11 @@ VARIANTS["t1024_wn_utd2"] = _with(dict(VARIANTS["t1024"], gradient_steps=2), wei
 #: 1024-wide critic (CrossQ's width) + SALE with TD7's settings (un-normalised zsa, rep lr 3e-4)
 VARIANTS["tall"] = _with(VARIANTS["t1024"], representation="sale")
 #: ... + horizon-aware discount (TD-MPC2 heuristic) for long-horizon tasks such as Swimmer
-VARIANTS["tall_gauto"] = dict(_with(VARIANTS["t1024"], representation="sale"), gamma="auto")
+VARIANTS["tall_gauto"] = dict(_with(VARIANTS["t1024"], representation="sale"), gamma="fifth")
 #: cheaper: 512-wide critic
 VARIANTS["t512_sale_gauto"] = dict(
     _with(_bn(512, entropy_schedule=(0.0, -0.5, 0.5), critic_loss="hl_gauss"), representation="sale"),
-    gamma="auto")
+    gamma="fifth")
 
 
 # ---- screen 6 (2026-09-29): exploration and returns on top of the screen-5 winner
@@ -209,14 +212,13 @@ for _name in list(VARIANTS):
     if _name != "default":
         VARIANTS[_name] = _pin_engine(VARIANTS[_name])
 
-#: The library default spelled out (identical to "default" today; it keeps this meaning if a default changes later,
+#: The library default from 2026-10-23 to 2026-11-12 spelled out (it keeps this meaning now that the default has changed,
 #: as "c1" does): C1's settings (the pinned "c1" above) + the fast engine, i.e. the former variant "fast4x".
-#: The TEMPO_test notebooks check that "default" equals it (notebooks/runlab.py).
 VARIANTS["fast"] = dict(VARIANTS["c1"], n_envs=4, batch_size=1024, train_freq=1, gpu_replay=True, act_on_cpu=True,
                         pipeline=True, fused_adam=True, amp="auto", invariance="samples", lr_rule="sqrt",
                         ref_batch=256, brn_impl="closed_form",
                         policy_kwargs=dict(VARIANTS["c1"]["policy_kwargs"], fused_critics=True))
-#: the recipe "default" must equal (the configuration check of the TEMPO_test notebooks)
+#: the recipe "default" had to equal until 2026-11-12 (the configuration check of the TEMPO_test notebooks; see the end)
 DEFAULT_RECIPE = "fast"
 #: The fast recipe as TEMPO's default resolves it on image observations (2026-11-03, CarRacing-v3): the phase engine
 #: (gpu_replay, act_on_cpu, pipeline) does not support images, so the default falls back to the classic engine with every
@@ -224,3 +226,76 @@ DEFAULT_RECIPE = "fast"
 VARIANTS["fast_image"] = dict(VARIANTS["fast"], gpu_replay=False, act_on_cpu=False, pipeline=False)
 #: the recipe "default" must equal on the pixel tasks of benchmarks.plans.IMAGE
 DEFAULT_RECIPE_IMAGE = "fast_image"
+
+
+# ---- 2026-11-13: TEMPO 2 became the library default (benchmarks/PROTOCOL.md, entry of 2026-11-13) -----------------------
+# TEMPO("MlpPolicy", env) now runs the fast recipe with three changes: the automatic discount never falls below 0.99
+# (gamma="auto": clip(1 - 5/T, 0.99, 0.995); the former rule is gamma="fifth"), continuous actions get a second, late
+# anneal of the entropy target (-0.5 -> -2.0 nats per dimension between 50 % and 80 % of the budget), and predict /
+# evaluation use an average of the actor (policy_average=5000 environment steps).
+#: Every variant above was run (or defined) while the library default was the fast recipe (or an earlier one). Their
+#: discount is explicit ("fifth" replaces the "auto" of their time: the same rule under its new name); the multi-step
+#: horizon and the continuous entropy schedule are pinned where a variant left them to the library, and the averaged
+#: policy, which did not exist, is pinned off, so that the new default
+#: changes none of them ("fast" trains bit for bit like TEMPO("MlpPolicy", env) of the library with source hash
+#: 2e417b4c09095fef, and evaluates with the newest actor as it did). "default" stays {}: whatever TEMPO("MlpPolicy", env)
+#: does now.
+for _name in list(VARIANTS):
+    if _name != "default":
+        VARIANTS[_name].setdefault("policy_average", None)
+        VARIANTS[_name].setdefault("n_step", 3)
+        if "entropy_schedule" not in VARIANTS[_name] and "entropy_schedule_continuous" not in VARIANTS[_name]:
+            # "sale", "wn_utd2", "sale_wn_utd2" left it to the library: the continuous default of their time
+            VARIANTS[_name]["entropy_schedule_continuous"] = (0.0, -0.5, 0.5)
+
+#: The library default spelled out (identical to "default" today; it keeps this meaning if a default changes later).
+#: The continuous entropy schedule applies to continuous actions only (tempo_kwargs); discrete actions keep the discrete
+#: schedule of the library.
+VARIANTS["tempo2"] = dict(VARIANTS["fast"], gamma="auto", entropy_schedule_continuous=(0.0, -0.5, 0.5, -2.0, 0.8),
+                          policy_average=5000)
+#: the recipe "default" must equal (the configuration check of the TEMPO_test notebooks, notebooks/runlab.py)
+DEFAULT_RECIPE = "tempo2"
+#: TEMPO 2 as the default resolves it on image observations (the classic engine; the averaged policy needs the phase engine
+#: and is ignored there)
+VARIANTS["tempo2_image"] = dict(VARIANTS["tempo2"], gpu_replay=False, act_on_cpu=False, pipeline=False)
+DEFAULT_RECIPE_IMAGE = "tempo2_image"
+#: research options, not part of the default (diagnostic runs of 2026-11-13, benchmarks/PROTOCOL.md):
+#: the whole time limit as the horizon where only the time limit ends an episode (Swimmer gains, HalfCheetah loses) ...
+VARIANTS["tempo2_limit"] = dict(VARIANTS["tempo2"], gamma="limit")
+#: ... and one-step returns once tempering has ended, on continuous actions (HalfCheetah gains, Walker2d loses)
+VARIANTS["tempo2_n1"] = dict(VARIANTS["tempo2"], n_step_continuous=(3, 1))
+
+
+# ==== 2026-11-18: ablations of the default for the supplementary material (TEMPO_test/Ablations) ========================
+# Each entry is the default ("tempo2", above) with exactly ONE part changed; nothing above this line is modified. The names
+# start with "TEMPO-" (they are also the folder names of their results and the row names of the supplementary table).
+# The notebook TEMPO_test/Ablations/TEMPO_ablations.ipynb runs them and stores their results in TEMPO_test/Ablations/results,
+# never in TEMPO_test/results (which the main comparison reads).
+def _ablation(**changes) -> dict:
+    import copy
+
+    out = copy.deepcopy(VARIANTS["tempo2"])
+    out.update(changes)
+    return out
+
+
+#: tempered entropy target -> a constant target. Continuous actions: -1 nat per action dimension, SAC's standard target
+#: -dim(A); discrete actions: 0.5 of the maximum entropy ln|A|. Written as a schedule whose start and end are equal, with the
+#: anneal fraction 0.5 of the default kept, because the novelty bonus (and nothing else here) decays over that fraction:
+#: the bonus anneal over the first half of training is unchanged.
+VARIANTS["TEMPO-FixedEntropy"] = _ablation(entropy_schedule_continuous=(-1.0, -1.0, 0.5),
+                                           entropy_schedule_discrete=(0.5, 0.5, 0.5))
+#: no tempered novelty bonus
+VARIANTS["TEMPO-NoBonus"] = _ablation(exploration_bonus=0.0)
+#: predict / evaluation use the newest actor instead of the averaged one
+VARIANTS["TEMPO-NoAverage"] = _ablation(policy_average=None)
+
+# ---- 2026-11-22: two more ablations (the learned representation and the categorical critic loss)
+#: HL-Gauss critic -> MSE regression critic. The library ties reward scaling to the critic loss (reward_scaling=None means
+#: "on with HL-Gauss, off with MSE"), so it is set to True explicitly: only the loss changes.
+VARIANTS["TEMPO-MSE"] = _ablation(critic_loss="mse", reward_scaling=True)
+#: no SALE representation: actor and critics see the encoder features only (no zs / zsa embeddings)
+VARIANTS["TEMPO-NoSALE"] = _ablation(policy_kwargs=dict(VARIANTS["tempo2"]["policy_kwargs"], representation=None))
+
+#: the ablations in table order (each one applies to discrete and to continuous actions)
+ABLATIONS = ("TEMPO-FixedEntropy", "TEMPO-NoBonus", "TEMPO-NoAverage", "TEMPO-MSE", "TEMPO-NoSALE")

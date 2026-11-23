@@ -127,6 +127,7 @@ import subprocess
 import sys
 import time
 import types
+import warnings
 from dataclasses import dataclass, field
 
 _HERE = pathlib.Path(__file__).resolve().parent
@@ -236,7 +237,9 @@ _SMOKE_ANNOUNCED: set = set()
 #: * any other ``gpu_replay`` variant: benchlab's model x ``GPU_REPLAY_SPEEDUP`` (a guess from the 2026-10-22
 #:   prototype; no such variant is defined).
 TEMPO_ENGINE_SPEEDUP = {"mps": 1.2, "cpu": 1.0}
-TEMPO_VARIANT_RATES = {"default": {"mps": 45.0 * 2.2}, "fast": {"mps": 45.0 * 2.2}}
+#: "tempo2" (the default since 2026-11-13) and its research twin run the same engine and the same number of updates as
+#: "fast" (their changes are schedules and the policy used by predict), so they are planned at the same rate.
+TEMPO_VARIANT_RATES = {v: {"mps": 45.0 * 2.2} for v in ("default", "fast", "tempo2", "tempo2_limit", "tempo2_n1")}
 #: planning factors on the C1 engine's rate for variants WITHOUT ``gpu_replay`` (none since 2026-10-23)
 TEMPO_VARIANT_FACTORS: dict = {}
 #: Where each entry of :data:`TEMPO_VARIANT_RATES` comes from (printed by the configuration cell's NOTE).
@@ -245,7 +248,7 @@ TEMPO_VARIANT_RATE_SOURCES = {
         "GPU throughput of the 4-environment engine shared by the 6 GPU slots (45) times the measured update-time "
         "speed-up of the closed-form Batch-Renorm kernel + fused critics (2.2; 2026-10-23, Hopper: 16.74 -> 7.53 ms per "
         "update). Measured: one run alone ~507 env-steps/s, two runs at once ~322 per run")
-    for v in ("default", "fast")}
+    for v in ("default", "fast", "tempo2", "tempo2_limit", "tempo2_n1")}
 GPU_REPLAY_SPEEDUP = {"mps": 31.0 / 16.4, "cpu": 1.0}
 #: The measurements behind the factors above (Apple M5 Pro, Hopper-v5, budget 500k so the novelty bonus is active;
 #: 2026-10-22: seeds 20/21, 15-25 s windows after learning starts; 2026-10-23: learn(500,000) stopped at 5,000 steps):
@@ -602,7 +605,8 @@ class Lab:
               + (" [smoke runs are shrunk]" if self.smoke else "")
               + f"; {self.earlier_text()}")
         if self.kind == "tempo":
-            what = ('TEMPO("MlpPolicy", env) with the library defaults (the fast recipe)' if self.variant == "default"
+            what = ('TEMPO("MlpPolicy", env) with the library defaults (TEMPO 2, benchmarks.variants "tempo2")'
+                    if self.variant == "default"
                     else f"variant '{self.variant}' of benchmarks/variants.py")
             print(f"TEMPO     : {what}; runs the LIVE tempo_rl (source {self.code_hash()}), never frozen")
             print(f"device    : {device_for(self, 'TEMPO')}")
@@ -1068,8 +1072,8 @@ _BUILD_NEW = '''def build(kwargs):
 #: speed options (``TEMPO(gpu_replay=..., ...)``, 2026-10-22/23); the swaps below add them (and the policy's
 #: ``fused_critics``), so a variant that differs from the reference only in one of them is reported as different (a
 #: library without them reads None on both sides). ``_amp`` is the autocast dtype resolved for the device.
-_FP_OLD = '"_entropy_unit", "_entropy_log_offset")}'
-_FP_NEW = ('"_entropy_unit", "_entropy_log_offset", "gpu_replay", "act_on_cpu", "pipeline", "fused_adam", "amp", '
+_FP_OLD = '"_entropy_unit", "_entropy_log_offset", "policy_average")}'
+_FP_NEW = ('"_entropy_unit", "_entropy_log_offset", "policy_average", "gpu_replay", "act_on_cpu", "pipeline", "fused_adam", "amp", '
            '"_amp", "invariance", "lr_rule", "ref_batch", "brn_impl", "n_envs")}')
 _FPP_OLD = '"representation", "augment_images")}'
 _FPP_NEW = '"representation", "augment_images", "fused_critics")}'
@@ -1094,6 +1098,9 @@ def _harness_flags_in_config_script(env: str | None = None):
     for a, b in ((_BUILD_OLD, _BUILD_NEW), (_FP_OLD, _FP_NEW), (_FPP_OLD, _FPP_NEW), (_OUT_OLD, _OUT_NEW)):
         if new.count(a) == 1:
             new = new.replace(a, b)
+        else:
+            warnings.warn("runlab: a part of benchlab's configuration script that runlab extends was not found; the "
+                          "configuration check compares fewer settings", RuntimeWarning, stacklevel=3)
     bl._CONFIG_SCRIPT = new
     old_ref = bl.reference_recipe
     bl.reference_recipe = (default_reference_recipe if env is None else
@@ -1251,7 +1258,7 @@ def _cost_note(lab: Lab) -> str | None:
     if lab.variant == "default":
         kw = {"gpu_replay": True, "pipeline": True, "n_envs": 4, "batch_size": 1024, "amp": "auto"}
         audition = False
-        what = "the default (the fast recipe since 2026-10-23"
+        what = "the default (TEMPO 2 since 2026-11-13, on the engine of the fast recipe of 2026-10-23"
     else:
         try:
             from benchmarks.variants import tempo_kwargs
@@ -2288,7 +2295,7 @@ def _note_job_list(lab: Lab, running: dict, jobs: list[dict]) -> None:
               "label is the task, not the variant).")
 
 
-#: Processes whose load would end up in the wall-clock time of benchmark runs (which the comparison's rank score uses): the
+#: Processes whose load would end up in the wall-clock time of benchmark runs (which the comparison's rank uses): the
 #: baseline hyperparameter search of notebooks/tunelab.py and the timing measurements of Comparison/timelab.py.
 _COMPETING_MARKS = ("benchmarks.tune_one", "tunelab.py _pool", "timelab.py _measure")
 
@@ -2330,7 +2337,7 @@ def launch(lab: Lab, jobs: list[dict], background: bool = True):
     if competing:
         print("Not launched: a baseline hyperparameter search (notebooks/tunelab.py) or a timing measurement "
               "(Comparison/timelab.py) is running. Runs started next to it would carry its load in their wall-clock time, "
-              "which the comparison's rank score uses. Run this cell again when it has finished:")
+              "which the comparison's rank uses. Run this cell again when it has finished:")
         for pid, cmd in competing[:6]:
             print(f"  pid {pid}: {cmd}")
         return None

@@ -4,19 +4,47 @@ TEMPO is an off-policy maximum-entropy actor-critic for discrete and continuous 
 configuration on every task. This repository holds the library (`tempo_rl`) and the code of its benchmark: TEMPO against
 SAC, TD3, CrossQ, PPO and DQN (Stable-Baselines3 / sb3-contrib) on 23 Gymnasium tasks, five seeds each.
 
+## Use TEMPO on your task
+
+```bash
+pip install "git+https://github.com/danialsj77/TEMPO.git"
+```
+
+```python
+from tempo_rl import TEMPO
+
+model = TEMPO("MlpPolicy", "LunarLander-v3", verbose=1)   # any Gymnasium task, discrete or continuous actions
+model.learn(total_timesteps=200_000)
+model.save("tempo_lunarlander")
+
+action, _ = model.predict(observation, deterministic=True)
+```
+
+There is no setting for the action type and no hyperparameter to choose for the task: TEMPO reads the action space, the
+observation space and the time limit of the environment and follows the training budget. The interface is the one of
+Stable-Baselines3 (`learn`, `predict`, `save`, `load`, callbacks, `evaluate_policy`).
+
+- **[User guide](docs/guide.md)**: which spaces are supported, how to pass your own environment, what TEMPO sets for
+  you, saving and loading, callbacks, the command line, every parameter.
+- **[`examples/quickstart.py`](examples/quickstart.py)**: train, save, load and evaluate on a Gymnasium task.
+- **[`examples/custom_env.py`](examples/custom_env.py)**: a task written from scratch and trained with continuous or
+  discrete actions by the same code.
+
 ## Contents
 
 | Path | What it is |
 |---|---|
 | `tempo_rl/` | the TEMPO library (Stable-Baselines3-style API: `TEMPO("MlpPolicy", env).learn(...)`) |
+| `docs/`, `examples/` | the [user guide](docs/guide.md) and two runnable examples |
 | `benchmarks/` | one run (`run_one.py`), the scheduler, the task registry (`plans.py`), the baselines' hyperparameters (`zoo.py`: RL-Baselines3-Zoo entries; `tuned_toy_text.json`: grid-search winners for the toy-text tasks), TEMPO configurations (`variants.py`), statistics (`report.py`) and the random-policy references (`random_scores.json`) |
 | `notebooks/` | the harness: `runlab.py` (protocol, jobs, devices, result checks), `benchlab.py`, `figstyle.py`, `tunelab.py` (the toy-text hyperparameter search) |
 | `Comparison/` | `complab.py` (comparison statistics, tables, figures) and `timelab.py` (training time of each algorithm measured alone) |
 | `scripts/` | `run_all.py` (all runs), `compare.py` (the comparison), `time_all.py` (the timing) |
 | `run_all.sh` | starts every run of the benchmark, 10 at a time by default |
 
-## Installation
+## Installation for the benchmark
 
+The library alone installs with the `pip` line above. The benchmark also needs the baselines and the simulators:
 Python 3.11 and a CUDA build of PyTorch:
 
 ```bash
